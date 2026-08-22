@@ -1,12 +1,3 @@
-/*
-TODO 
-1. Create a socket
-2. Bind it
-3. Listen
-4. Accept
-5. Receive
-6. Print
-*/
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -14,13 +5,6 @@ TODO
 #include <unistd.h>
 #include <iostream>
 #include <cstring>
-
-
-#include <cstring>
-#include <iostream>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 int main() {
 
@@ -41,14 +25,28 @@ int main() {
     //listen for incoming connections
     listen(serverSocket, 5);
 
+    std::cout << "Server ready waiting for client connections " << std::endl; 
+
     //accepting client connection
     int clientSocket = accept(serverSocket, nullptr, nullptr);
 
     //receiving data from client
     char buffer[1024] = {0};
-    recv(clientSocket, buffer, sizeof(buffer), 0);
-    std::cout << "Message from client: " << buffer << std::endl;
 
+    while(true) {
+        memset(buffer, 0, sizeof(buffer));
+
+        int bytesReceived = recv(clientSocket, buffer, sizeof(buffer)-1, 0); 
+
+        if(bytesReceived == 0) {
+            std::cout << "Client Disconnected \n";
+            break;
+        }
+        std::cout << "Message from client: " << buffer << std::endl;
+
+    }
+    
+    close(clientSocket);
     close(serverSocket);
 
 }

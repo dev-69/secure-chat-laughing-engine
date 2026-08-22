@@ -1,21 +1,3 @@
-/*
-TODO 
-1. Create a socket
-2. Connect
-3. Send
-4. Close
-*/
-
-/*
-TODO 
-1. Create a socket
-2. Bind it
-3. Listen
-4. Accept
-5. Receive
-6. Print
-*/
-
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -40,10 +22,18 @@ int main() {
     //connecting to server
     connect(clientSocket, (struct sockaddr*)&serverAddress, sizeof(serverAddress));
 
-    //send data to server
-    const char* message = "Hello, server!";
-    
-    send(clientSocket, message, strlen(message), 0);    
+    std::string message;
+
+    while(true) {
+        std::cout << "Enter message: ";
+        std::getline(std::cin, message);
+
+        if(message == "quit")
+            break;
+
+        //send data to server
+        send(clientSocket, message.c_str(), strlen(message.c_str()), 0);    
+    }
 
     close(clientSocket);
 }
