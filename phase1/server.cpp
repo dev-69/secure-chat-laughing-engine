@@ -5,6 +5,93 @@
 #include <unistd.h>
 #include <iostream>
 #include <cstring>
+#include <thread>
+#include <unordered_map>
+#include <mutex>
+
+std::unordered_map<std::string, int> clients;
+std::mutex clients_mutex;
+
+void handleClient(int clientSocket) {
+    std::cout << "New client connected" << std::endl;
+    //receiving data from client
+    char buffer[1024] = {0};
+
+    std::string prompt = "Server: Enter your username: ";
+    send(clientSocket, prompt.c_str(), prompt.length(), 0);
+
+    int bytesReceived = recv(clientSocket, buffer, sizeof(buffer)-1, 0); 
+
+    if(bytesReceived == 0) {
+        std::cout << "Client Disconnected \n";
+        close(clientSocket);
+        return;
+    }
+
+    std::string username(buffer);
+
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex);
+        clients[username] = clientSocket;
+    }
+    std::cout << "[INFO] " << username << " connected.\n";
+
+    while(true) {
+        memset(buffer, 0, sizeof(buffer));
+        
+        bytesReceived = recv(clientSocket, buffer, sizeof(buffer)-1, 0); 
+
+        if(bytesReceived <= 0) {
+            break; 
+        }
+        
+        std::string msg(buffer);
+        
+        if(msg == "/quit") {
+            break;
+        }
+        else if(msg == "/who") {
+            std::string who_list = "\n--- Online Users ---\n";
+            
+            std::lock_guard<std::mutex> lock(clients_mutex);
+            for (const auto& pair : clients) {
+                who_list += "- " + pair.first + "\n";
+            }
+            who_list += "--------------------\n";
+            
+            send(clientSocket, who_list.c_str(), who_list.length(), 0);
+        }
+        else if(msg[0] == '@') {
+            //username part   
+            int space_pos = msg.find(' ');
+            if(space_pos != std::string::npos) {
+                std::string target_user = msg.substr(1, space_pos-1);
+                std::string actual_msg = msg.substr(space_pos+1);
+
+                std::string formatted = "\n[" + username + "] says: " + actual_msg;
+
+                std::lock_guard<std::mutex> lock(clients_mutex);
+
+                //user exists in map
+                if(clients.find(target_user) != clients.end()) {
+                    int target_socket = clients[target_user];
+                    send(target_socket, formatted.c_str(), formatted.length(), 0);
+                }
+                else {
+                    std::string err = "\nServer: User '" + target_user + "' is not online or does not exist.\n";
+                    send(clientSocket, err.c_str(), err.length(), 0);
+                }
+            }
+        }
+    }
+    //cleanup
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex);
+        clients.erase(username);
+    }
+    close(clientSocket);
+    std::cout << "[INFO] " << username << " disconnected.\n";
+}
 
 int main() {
 
@@ -27,26 +114,16 @@ int main() {
 
     std::cout << "Server ready waiting for client connections " << std::endl; 
 
-    //accepting client connection
-    int clientSocket = accept(serverSocket, nullptr, nullptr);
-
-    //receiving data from client
-    char buffer[1024] = {0};
 
     while(true) {
-        memset(buffer, 0, sizeof(buffer));
-
-        int bytesReceived = recv(clientSocket, buffer, sizeof(buffer)-1, 0); 
-
-        if(bytesReceived == 0) {
-            std::cout << "Client Disconnected \n";
-            break;
-        }
-        std::cout << "Message from client: " << buffer << std::endl;
-
+        //now multiple threads will be accepting client connection
+        int clientSocket = accept(serverSocket, nullptr, nullptr);
+        
+        //creating a thread and running it individually
+        std::thread clientThread (handleClient, clientSocket);
+        clientThread.detach();
     }
-    
-    close(clientSocket);
+
     close(serverSocket);
 
 }
