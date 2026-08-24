@@ -11,6 +11,12 @@
 
 std::unordered_map<std::string, int> clients;
 std::mutex clients_mutex;
+std::mutex console_mutex;
+
+void logToConsole(const std::string& logText) {
+    std::lock_guard<std::mutex> lock(console_mutex);
+    std::cout << logText << std::endl;
+}
 
 void handleClient(int clientSocket) {
     std::cout << "New client connected" << std::endl;
@@ -22,7 +28,7 @@ void handleClient(int clientSocket) {
 
     int bytesReceived = recv(clientSocket, buffer, sizeof(buffer)-1, 0); 
 
-    if(bytesReceived == 0) {
+    if(bytesReceived <= 0) {
         std::cout << "Client Disconnected \n";
         close(clientSocket);
         return;
@@ -32,9 +38,15 @@ void handleClient(int clientSocket) {
 
     {
         std::lock_guard<std::mutex> lock(clients_mutex);
+        if (clients.find(username) != clients.end()) {
+            std::string errMsg = "Server: Username already taken. Disconnecting...\n";
+            send(clientSocket, errMsg.c_str(), errMsg.length(), 0);
+            close(clientSocket);
+            return; 
+        }
         clients[username] = clientSocket;
     }
-    std::cout << "[INFO] " << username << " connected.\n";
+    logToConsole("[INFO] " + username + " connected.");
 
     while(true) {
         memset(buffer, 0, sizeof(buffer));
@@ -61,6 +73,7 @@ void handleClient(int clientSocket) {
             
             send(clientSocket, who_list.c_str(), who_list.length(), 0);
         }
+        
         else if(msg[0] == '@') {
             //username part   
             int space_pos = msg.find(' ');
@@ -76,6 +89,7 @@ void handleClient(int clientSocket) {
                 if(clients.find(target_user) != clients.end()) {
                     int target_socket = clients[target_user];
                     send(target_socket, formatted.c_str(), formatted.length(), 0);
+                    logToConsole("[CHAT] " + username + " -> " + target_user + " : " + actual_msg);
                 }
                 else {
                     std::string err = "\nServer: User '" + target_user + "' is not online or does not exist.\n";
@@ -90,13 +104,20 @@ void handleClient(int clientSocket) {
         clients.erase(username);
     }
     close(clientSocket);
-    std::cout << "[INFO] " << username << " disconnected.\n";
+    logToConsole("[INFO] " + username + " disconnected.");
 }
 
 int main() {
 
     //creating the server socket
     int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+
+    //for immediate port reuse
+    int opt = 1;
+    if (setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        std::cerr << "setsockopt failed\n";
+        return 1;
+    }
 
     //defining server address
     sockaddr_in serverAddress;
@@ -107,7 +128,10 @@ int main() {
 
 
     //bind the server socket to the server address
-    bind(serverSocket, (struct sockaddr*)&serverAddress, sizeof(serverAddress));
+    if(bind(serverSocket, (struct sockaddr*)&serverAddress, sizeof(serverAddress)) < 0) {
+        std::cerr << "Bind failed" << std::endl;
+        return 1;
+    }
 
     //listen for incoming connections
     listen(serverSocket, 5);

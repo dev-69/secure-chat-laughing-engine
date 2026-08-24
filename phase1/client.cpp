@@ -16,6 +16,8 @@ void receiveMessages(int socket) {
             std::cout << "\nDisconnected from server.\n";
             break;
         }
+        std::cout << std::endl << buffer << std::endl << "Enter Message: "; 
+        std::cout.flush();
     }
 }
 
@@ -23,7 +25,6 @@ int main() {
 
     //creating socket
     int clientSocket = socket(AF_INET, SOCK_STREAM, 0);
-
 
     //defining server address
     sockaddr_in serverAddress;
@@ -40,6 +41,14 @@ int main() {
 
     std::cout << "Connected to the server \n";
 
+    char promptBuffer[1024] = {0};
+    recv(clientSocket, promptBuffer, sizeof(promptBuffer)-1, 0);
+    std::cout << promptBuffer; 
+    
+    std::string username;
+    std::getline(std::cin, username);
+    send(clientSocket, username.c_str(), username.length(), 0);
+
     //incoming messages thread
     std::thread receiver(receiveMessages, clientSocket);
     receiver.detach();
@@ -51,6 +60,9 @@ int main() {
         std::cout << "Enter message: ";
         std::getline(std::cin, message);
 
+        if(message.empty())
+            continue;
+
         if(message == "/quit") {
             send(clientSocket, "/quit", 5, 0);
             break;
@@ -60,9 +72,15 @@ int main() {
             send(clientSocket, "/who", 4, 0);
         }
         
-        else if(message.substr(0, 6) == "/chat") {
-            currentPartner = message.substr(6);
-            std::cout << "Chat partner set to " << currentPartner << std::endl;
+        else if(message.length() >= 5 && message.substr(0, 5) == "/chat") {
+
+            if(message.length() > 6) {
+                currentPartner = message.substr(6);
+                std::cout << "Chat partner set to " << currentPartner << std::endl;
+            }
+            else {
+                std::cout << "Invalid Format. Use: /chat username" << std::endl;
+            }
         }
 
         else if(message[0] == '@') {
