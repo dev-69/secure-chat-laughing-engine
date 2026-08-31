@@ -20,6 +20,11 @@ void receiveMessages(int socket, DHE* dh) {
         
         // Decrypt the incoming bytes
         std::vector<unsigned char> payload(buffer, buffer + bytesReceived);
+
+        // if (payload.size() > 28) { 
+        //     std::cout << "\n[TEST] Flipping one bit in the received ciphertext..." << std::endl;
+        //     payload[30] ^= 0x01; 
+        // }
         std::string decrypted_msg = dh->decrypt(payload);
         
         std::cout << "\n" << decrypted_msg << "\n" << std::flush; 
