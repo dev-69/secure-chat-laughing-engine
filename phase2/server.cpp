@@ -8,7 +8,16 @@
 #include <unordered_map>
 #include <mutex>
 
-std::unordered_map<std::string, int> clients;
+#include "dh.cpp"
+
+// std::unordered_map<std::string, int> clients;
+
+struct ClientData {
+    int socket;
+    DHE* dh_ptr;
+};
+std::unordered_map<std::string, ClientData> clients;
+
 std::mutex clients_mutex;
 std::mutex console_mutex;
 
@@ -18,14 +27,19 @@ void logToConsole(const std::string& logText) {
 }
 
 void handleClient(int clientSocket) {
-    std::cout << "New client connected" << std::endl;
-    //receiving data from client
-    char buffer[1024] = {0};
+    DHE dh;
+    //generating keys
+    dh.generateKeys();
 
-    std::string prompt = "Server: Enter your username: ";
-    send(clientSocket, prompt.c_str(), prompt.length(), 0);
+    //serializing my own (server key)
+    int public_key_len = BN_num_bytes(dh.pub_key);
+    std::vector<unsigned char> public_key_bytes(public_key_len);
+    BN_bn2bin(dh.pub_key, public_key_bytes.data());
 
-    int bytesReceived = recv(clientSocket, buffer, sizeof(buffer)-1, 0); 
+    //send to send my public key (server) to client
+    unsigned char client_pub_key[256] = {0};
+    send(clientSocket, public_key_bytes.data(), public_key_len, 0);
+    int bytesReceived = recv(clientSocket, client_pub_key, sizeof(client_pub_key), 0); 
 
     if(bytesReceived <= 0) {
         std::cout << "Client Disconnected \n";
@@ -33,31 +47,60 @@ void handleClient(int clientSocket) {
         return;
     }
 
-    std::string username(buffer);
+    //converting received bytes back to bigNum
+    BIGNUM* bn = BN_new();
+    BN_bin2bn(client_pub_key, bytesReceived, bn);
+
+    //fingerprint
+    dh.compute_key(bn);
+    std::cout << "DH Fingerprint: " << dh.getFingerPrint() << std::endl;
+    BN_free(bn);
+
+    std::cout << "New client connected" << std::endl;
+
+    std::string prompt = "Server: Enter your username: ";
+    std::vector<unsigned char> enc_prompt = dh.encrypt(prompt);
+    send(clientSocket, enc_prompt.data(), enc_prompt.size(), 0);
+
+    //receiving data from client
+    unsigned char buffer[2048] = {0};
+    bytesReceived = recv(clientSocket, buffer, sizeof(buffer), 0);
+
+    if(bytesReceived <= 0) {
+        std::cout << "Client Disconnected \n";
+        close(clientSocket);
+        return;
+        
+    }
+    std::vector<unsigned char> payload(buffer, buffer + bytesReceived);
+    std::string username = dh.decrypt(payload);
 
     {
         std::lock_guard<std::mutex> lock(clients_mutex);
         if (clients.find(username) != clients.end()) {
-            std::string errMsg = "Server: Username already taken. Disconnecting...\n";
-            send(clientSocket, errMsg.c_str(), errMsg.length(), 0);
+            std::string errMsg = "Server: Username already taken.\n";
+            std::vector<unsigned char> enc_err = dh.encrypt(errMsg);
+            send(clientSocket, enc_err.data(), enc_err.size(), 0);
             close(clientSocket);
             return; 
         }
-        clients[username] = clientSocket;
+        // Save both!
+        clients[username] = {clientSocket, &dh};
     }
     logToConsole("[INFO] " + username + " connected.");
+
 
     while(true) {
         memset(buffer, 0, sizeof(buffer));
         
-        bytesReceived = recv(clientSocket, buffer, sizeof(buffer)-1, 0); 
+        bytesReceived = recv(clientSocket, buffer, sizeof(buffer), 0); 
 
         if(bytesReceived <= 0) {
             break; 
         }
-        
-        std::string msg(buffer);
-        
+        std::vector<unsigned char> chat_payload(buffer, buffer + bytesReceived);
+        std::string msg = dh.decrypt(chat_payload);
+                
         if(msg == "/quit") {
             break;
         }
@@ -70,7 +113,9 @@ void handleClient(int clientSocket) {
             }
             who_list += "--------------------\n";
             
-            send(clientSocket, who_list.c_str(), who_list.length(), 0);
+
+            std::vector<unsigned char> who_list_enc = dh.encrypt(who_list);
+            send(clientSocket, who_list_enc.data(), who_list_enc.size(), 0);
         }
         
         else if(msg[0] == '@') {
@@ -86,13 +131,15 @@ void handleClient(int clientSocket) {
 
                 //user exists in map
                 if(clients.find(target_user) != clients.end()) {
-                    int target_socket = clients[target_user];
-                    send(target_socket, formatted.c_str(), formatted.length(), 0);
+                    int target_socket = clients[target_user].socket;
+                    std::vector<unsigned char> enc_formatted = clients[target_user].dh_ptr->encrypt(formatted);
+                    send(target_socket, enc_formatted.data(), enc_formatted.size(), 0);
                     logToConsole("[CHAT] " + username + " -> " + target_user + " : " + actual_msg);
                 }
                 else {
                     std::string err = "\nServer: User '" + target_user + "' is not online or does not exist.\n";
-                    send(clientSocket, err.c_str(), err.length(), 0);
+                    std::vector<unsigned char> enc_err = dh.encrypt(err);
+                    send(clientSocket, enc_err.data(), enc_err.size(), 0);
                 }
             }
         }
