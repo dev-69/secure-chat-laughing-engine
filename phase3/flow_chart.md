@@ -87,3 +87,34 @@ Client                                      Server
   │                                            │
   │============= encrypted chat ==============│
 
+
+
+CLIENT                                      SERVER
+  │                                            │
+  │──────────── TCP connection ───────────────>│
+  │                                            │
+  │<────────── server certificate ─────────────│
+  │                                            │
+  │ Verify certificate using trusted CA        │
+  │                                            │
+  │ ✓ CA signature                             │
+  │ ✓ validity period                          │
+  │                                            │
+  │──────── random 32-byte challenge ─────────>│
+  │                                            │
+  │                                  Sign(challenge)
+  │                                  using server.key
+  │                                            │
+  │<──────────── signature ────────────────────│
+  │                                            │
+  │ Verify(signature, challenge,               │
+  │           public key from certificate)     │
+  │                                            │
+  │ ✓ Proof of possession                      │
+  │                                            │
+  │──────────── DH public key ────────────────>│
+  │<──────────── DH public key ────────────────│
+  │                                            │
+  │          Shared DH secret                  │
+  │                                            │
+  │          AES-256-GCM chat                  │
