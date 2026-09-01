@@ -1,0 +1,501 @@
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <iostream>
+#include <thread>
+#include <cstring>
+
+#include <openssl/x509.h>
+#include <openssl/pem.h>
+#include <openssl/rand.h>
+#include <openssl/x509_vfy.h>
+
+#include "dh.cpp"
+
+bool sendAll(int socket, const unsigned char* data, size_t length) {
+    size_t totalSent = 0;
+
+    while (totalSent < length) {
+        ssize_t sent = send(
+            socket,
+            data + totalSent,
+            length - totalSent,
+            0
+        );
+
+        if (sent <= 0) {
+            return false;
+        }
+
+        totalSent += sent;
+    }
+
+    return true;
+}
+
+void receiveMessages(int socket, DHE* dh) {
+    unsigned char buffer[2048] = {0}; 
+    while(true) {
+        memset(buffer, 0, sizeof(buffer));
+        int bytesReceived = recv(socket, buffer, sizeof(buffer), 0);
+        
+        if(bytesReceived <= 0) {
+            std::cout << "\nDisconnected from server.\n";
+            break;
+        }
+        
+        // Decrypt the incoming bytes
+        std::vector<unsigned char> payload(buffer, buffer + bytesReceived);
+
+        // if (payload.size() > 28) { 
+        //     std::cout << "\n[TEST] Flipping one bit in the received ciphertext..." << std::endl;
+        //     payload[30] ^= 0x01; 
+        // }
+        std::string decrypted_msg = dh->decrypt(payload);
+        
+        std::cout << "\n" << decrypted_msg << "\n" << std::flush; 
+    }
+}
+
+bool recvAll(int socket, unsigned char* data, size_t length) {
+    size_t totalReceived = 0;
+
+    while (totalReceived < length) {
+        ssize_t received = recv(
+            socket,
+            data + totalReceived,
+            length - totalReceived,
+            0
+        );
+
+        if (received <= 0) {
+            return false;
+        }
+
+        totalReceived += received;
+    }
+
+    return true;
+}
+
+int main() {
+
+    //creating socket
+    int clientSocket = socket(AF_INET, SOCK_STREAM, 0);
+
+    //defining server address
+    sockaddr_in serverAddress;
+
+    serverAddress.sin_family = AF_INET;
+    serverAddress.sin_port = htons(1111);
+    serverAddress.sin_addr.s_addr = INADDR_ANY;
+
+    //connecting to server
+    if(connect(clientSocket, (struct sockaddr*)&serverAddress, sizeof(serverAddress)) < 0) {
+        std::cerr << "Connection Failed \n";
+        return 1;
+    }
+
+    std::cout << "Connected to the server \n";
+
+    uint32_t certLengthNetwork;
+
+    if (!recvAll(
+        clientSocket,
+        reinterpret_cast<unsigned char*>(&certLengthNetwork),
+        sizeof(certLengthNetwork))) {
+
+        std::cerr << "Failed to receive certificate length\n";
+        close(clientSocket);
+        return 1;
+    }
+
+    uint32_t certLength = ntohl(certLengthNetwork);
+
+    std::vector<unsigned char> serverCertificate(certLength);
+
+    if (!recvAll(
+        clientSocket,
+        serverCertificate.data(),
+        serverCertificate.size())) {
+
+        std::cerr << "Failed to receive server certificate\n";
+        close(clientSocket);
+        return 1;
+    }
+
+    std::cout << "Received server certificate ("
+          << serverCertificate.size()
+          << " bytes)\n";
+
+    BIO* certBio = BIO_new_mem_buf(
+        serverCertificate.data(),
+        serverCertificate.size()
+    );
+
+    X509* serverCert = PEM_read_bio_X509(
+        certBio,
+        nullptr,
+        nullptr,
+        nullptr
+    );
+    
+    if (!serverCert) {
+        std::cerr << "Failed to parse server certificate\n";
+        BIO_free(certBio);
+        close(clientSocket);
+        return 1;
+    }
+
+    FILE* caFile = fopen("certs/ca.crt", "r");
+
+    if (!caFile) {
+        std::cerr << "Could not open trusted CA certificate\n";
+        X509_free(serverCert);
+        BIO_free(certBio);
+        close(clientSocket);
+        return 1;
+    }
+
+    X509* caCert = PEM_read_X509(
+        caFile,
+        nullptr,
+        nullptr,
+        nullptr
+    );
+
+    fclose(caFile);
+
+
+    if (!caCert) {
+        std::cerr << "Failed to parse CA certificate\n";
+        X509_free(serverCert);
+        BIO_free(certBio);
+        close(clientSocket);
+        return 1;
+    }
+    X509_STORE* store = X509_STORE_new();
+
+    if (!store) {
+        std::cerr << "Failed to create certificate store\n";
+
+        X509_free(caCert);
+        X509_free(serverCert);
+        BIO_free(certBio);
+
+        close(clientSocket);
+        return 1;
+    }
+
+    if (X509_STORE_add_cert(store, caCert) != 1) {
+    std::cerr << "Failed to add CA certificate to trust store\n";
+
+        X509_STORE_free(store);
+        X509_free(caCert);
+        X509_free(serverCert);
+        BIO_free(certBio);
+
+        close(clientSocket);
+        return 1;
+    }
+
+    X509_STORE_CTX* verifyCtx = X509_STORE_CTX_new();
+
+    if (!verifyCtx) {
+        std::cerr << "Failed to create verification context\n";
+
+        X509_STORE_free(store);
+        X509_free(caCert);
+        X509_free(serverCert);
+        BIO_free(certBio);
+
+        close(clientSocket);
+        return 1;
+
+    }
+
+    if (X509_STORE_CTX_init(
+        verifyCtx,
+        store,
+        serverCert,
+        nullptr) != 1) {
+
+        std::cerr << "Failed to initialize certificate verification\n";
+
+        X509_STORE_CTX_free(verifyCtx);
+        X509_STORE_free(store);
+        X509_free(caCert);
+        X509_free(serverCert);
+        BIO_free(certBio);
+
+        close(clientSocket);
+        return 1;
+    }
+    
+    int verifyResult = X509_verify_cert(verifyCtx);
+
+    if (verifyResult != 1) {
+
+        std::cerr << "SERVER CERTIFICATE VALIDATION FAILED\n";
+
+        int error = X509_STORE_CTX_get_error(verifyCtx);
+
+        std::cerr << "Reason: "
+                  << X509_verify_cert_error_string(error)
+                  << std::endl;
+
+        X509_STORE_CTX_free(verifyCtx);
+        X509_STORE_free(store);
+        X509_free(caCert);
+        X509_free(serverCert);
+        BIO_free(certBio);
+
+        close(clientSocket);
+        return 1;
+    }
+
+    std::cout << "Server certificate validation SUCCESS\n";
+    X509_STORE_CTX_free(verifyCtx);
+    X509_STORE_free(store);
+    X509_free(caCert);
+    BIO_free(certBio);
+
+    //sednign a challenge for proof of possession
+    unsigned char challenge[32];
+    if (RAND_bytes(challenge, sizeof(challenge)) != 1) {
+        std::cerr << "Failed to generate challenge\n";
+        close(clientSocket);
+        return 1;
+    }
+
+    if (!sendAll(
+            clientSocket,
+            challenge,
+            sizeof(challenge))) {
+
+        std::cerr << "Failed to send challenge\n";
+        close(clientSocket);
+        return 1;
+    }
+    std::cout << "Challenge sent to server\n";
+
+
+    EVP_PKEY* serverPublicKey = X509_get_pubkey(serverCert);
+    if (!serverPublicKey) {
+        std::cerr << "Failed to extract public key from server certificate\n";
+
+        X509_free(serverCert);
+        close(clientSocket);
+        return 1;
+    }
+
+    uint32_t signatureLengthNetwork;
+
+    if (!recvAll(
+            clientSocket,
+            reinterpret_cast<unsigned char*>(&signatureLengthNetwork),
+            sizeof(signatureLengthNetwork))) {
+
+        std::cerr << "Failed to receive signature length\n";
+
+        EVP_PKEY_free(serverPublicKey);
+        X509_free(serverCert);
+        close(clientSocket);
+        return 1;
+    }
+    uint32_t signatureLength = ntohl(signatureLengthNetwork);
+    std::vector<unsigned char> signature(signatureLength);
+    
+    if (!recvAll(
+            clientSocket,
+            signature.data(),
+            signature.size())) {
+
+        std::cerr << "Failed to receive signature\n";
+
+        EVP_PKEY_free(serverPublicKey);
+        X509_free(serverCert);
+        close(clientSocket);
+        return 1;
+    }
+    std::cout << "Received server signature\n";
+    
+    EVP_MD_CTX* verifyCtx2 = EVP_MD_CTX_new();
+    if (!verifyCtx2) {
+    std::cerr << "Failed to create signature verification context\n";
+
+    EVP_PKEY_free(serverPublicKey);
+    X509_free(serverCert);
+    close(clientSocket);
+    return 1;
+}
+
+    if (EVP_DigestVerifyInit(
+            verifyCtx2,
+            nullptr,
+            EVP_sha256(),
+            nullptr,
+            serverPublicKey) != 1) {
+
+        std::cerr << "Failed to initialize signature verification\n";
+
+        EVP_MD_CTX_free(verifyCtx2);
+        EVP_PKEY_free(serverPublicKey);
+        X509_free(serverCert);
+        close(clientSocket);
+        return 1;
+    }
+
+    if (EVP_DigestVerifyUpdate(
+            verifyCtx2,
+            challenge,
+            sizeof(challenge)) != 1) {
+
+        std::cerr << "Failed to process challenge for verification\n";
+
+        EVP_MD_CTX_free(verifyCtx2);
+        EVP_PKEY_free(serverPublicKey);
+        X509_free(serverCert);
+        close(clientSocket);
+        return 1;
+    }
+
+    int signatureResult = EVP_DigestVerifyFinal(
+        verifyCtx2,
+        signature.data(),
+        signature.size()
+    );
+
+    if (signatureResult != 1) {
+
+        std::cerr << "SERVER PROOF-OF-POSSESSION FAILED\n";
+
+        EVP_MD_CTX_free(verifyCtx2);
+        EVP_PKEY_free(serverPublicKey);
+        X509_free(serverCert);
+
+        close(clientSocket);
+        return 1;
+    }
+    std::cout << "Server proof-of-possession SUCCESS\n";
+
+    EVP_MD_CTX_free(verifyCtx2);
+    EVP_PKEY_free(serverPublicKey);
+    X509_free(serverCert);
+    
+    //as soon as we connect to the serve we should exchange information
+    DHE dh;
+    dh.generateKeys();
+
+    //creating my own client side keys
+    int public_key_len = BN_num_bytes(dh.pub_key);
+    std::vector<unsigned char> public_key_bytes(public_key_len);
+    BN_bn2bin(dh.pub_key, public_key_bytes.data());
+
+    //sending server my (client's) public key
+    send(clientSocket, public_key_bytes.data(), public_key_len, 0);
+
+    //receiving server public key
+    unsigned char server_pub_key[256] = {0}; // 2048 bits is exactly 256 bytes
+    int bytesReceived = recv(clientSocket, server_pub_key, sizeof(server_pub_key), 0);
+
+    if(bytesReceived <= 0) {
+        std::cout << "Server Disconnected during handshake\n";
+        close(clientSocket);
+        return 1;
+    }
+
+    BIGNUM* bn = BN_new();
+    BN_bin2bn(server_pub_key, bytesReceived, bn);
+
+    dh.compute_key(bn);
+    std::cout << "DH Fingerprint: " << dh.getFingerPrint() << std::endl;
+    BN_free(bn); 
+
+    // char promptBuffer[1024] = {0};
+    // recv(clientSocket, promptBuffer, sizeof(promptBuffer)-1, 0);
+    // std::cout << promptBuffer; 
+    
+    // std::string username;
+    // std::getline(std::cin, username);
+    // send(clientSocket, username.c_str(), username.length(), 0);
+    unsigned char promptBuffer[1024] = {0};
+    int promptBytes = recv(clientSocket, promptBuffer, sizeof(promptBuffer), 0);
+    if(promptBytes > 0) {
+        std::vector<unsigned char> payload(promptBuffer, promptBuffer + promptBytes);
+        std::string decrypted_prompt = dh.decrypt(payload);
+        std::cout << decrypted_prompt; 
+    }
+
+    std::string username;
+    std::getline(std::cin, username);
+
+    std::vector<unsigned char> enc_username = dh.encrypt(username);
+    send(clientSocket, enc_username.data(), enc_username.size(), 0);
+
+
+    //incoming messages thread
+    //std::thread receiver(receiveMessages, clientSocket);
+    std::thread receiver(receiveMessages, clientSocket, &dh);
+    receiver.detach();
+
+    std::string message;
+    std::string currentPartner = "";
+
+    while(true) {
+        std::cout << "Enter message: ";
+        std::getline(std::cin, message);
+
+        if(message.empty())
+            continue;
+
+        if(message == "/quit") {
+            std::vector<unsigned char> encrypted_msg = dh.encrypt("/quit");
+            send(clientSocket, encrypted_msg.data(), encrypted_msg.size(), 0);
+            break;
+        }
+
+        else if(message == "/who") {
+            std::vector<unsigned char> encrypted_msg = dh.encrypt("/who");
+            send(clientSocket, encrypted_msg.data(), encrypted_msg.size(), 0);
+        }
+        
+        else if(message.length() >= 5 && message.substr(0, 5) == "/chat") {
+
+            if(message.length() > 6) {
+                currentPartner = message.substr(6);
+                std::cout << "Chat partner set to " << currentPartner << std::endl;
+            }
+            else {
+                std::cout << "Invalid Format. Use: /chat username" << std::endl;
+            }
+        }
+
+        else if(message[0] == '@') {
+            int space_pos = message.find(' ');
+            if(space_pos != std::string::npos) {
+                currentPartner = message.substr(1, space_pos-1);
+                std::cout << "[SYSTEM] Chat partner sent to: " << currentPartner << std::endl;
+
+                std::vector<unsigned char> encrypted_msg = dh.encrypt(message);
+                send(clientSocket, encrypted_msg.data(), encrypted_msg.size(), 0);
+            }
+            else {
+                std::cout << "[System] Invalid format. Use: @username message" << std::endl;
+            }
+        }
+        else {
+            if (currentPartner.empty()) {
+                std::cout << "[SYSTEM] No chat partner selected. Use /chat username first." << std::endl;
+            } 
+            else {
+                std::string formatted_msg = "@" + currentPartner + " " + message;
+                std::vector<unsigned char> encrypted_msg = dh.encrypt(formatted_msg);
+                send(clientSocket, encrypted_msg.data(), encrypted_msg.size(), 0);
+            }
+        }
+    }
+
+    close(clientSocket);
+}
