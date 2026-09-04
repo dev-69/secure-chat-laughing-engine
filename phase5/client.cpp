@@ -1,0 +1,1467 @@
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <iostream>
+#include <thread>
+#include <cstring>
+#include <mutex>
+#include <atomic>
+#include <chrono>
+#include <ctime>
+#include <iomanip>
+#include <sstream>
+#include <cstdint>
+
+#include <openssl/x509.h>
+#include <openssl/pem.h>
+#include <openssl/rand.h>
+#include <openssl/x509_vfy.h>
+
+#include "dh.cpp"
+
+DHE* e2eDh = nullptr;
+DHE* pendingE2eDh = nullptr;
+bool e2eEstablished = false;
+bool e2eRotationInProgress = false;
+std::string e2ePartner = "";
+std::string localUsername = "";
+uint64_t e2eRotationRound = 0;
+uint64_t pendingRotationRound = 0;
+
+std::mutex e2eMutex;
+std::mutex socketSendMutex;
+std::atomic<bool> clientRunning(true);
+
+const int REKEY_INTERVAL_SECONDS = 10;
+
+std::string getE2EFingerprint(DHE& dh)
+{
+    return dh.getFingerPrint();
+}
+
+std::vector<unsigned char> getPublicKeyBytes(DHE& dh)
+{
+    int len = BN_num_bytes(dh.pub_key);
+
+    std::vector<unsigned char> key(len);
+
+    BN_bn2bin(dh.pub_key, key.data());
+
+    return key;
+}
+
+bool sendAll(int socket, const unsigned char* data, size_t length) {
+    size_t totalSent = 0;
+
+    while (totalSent < length) {
+        ssize_t sent = send(
+            socket,
+            data + totalSent,
+            length - totalSent,
+            0
+        );
+
+        if (sent <= 0) {
+            return false;
+        }
+
+        totalSent += sent;
+    }
+
+    return true;
+}
+
+std::string toHex(const std::vector<unsigned char>& data)
+{
+    static const char hex[] = "0123456789ABCDEF";
+
+    std::string result;
+
+    for (unsigned char c : data) {
+        result += hex[c >> 4];
+        result += hex[c & 0x0F];
+    }
+
+    return result;
+}
+
+std::vector<unsigned char> fromHex(const std::string& hex)
+{
+    std::vector<unsigned char> result;
+
+    for (size_t i = 0; i < hex.size(); i += 2) {
+
+        unsigned int value;
+
+        sscanf(
+            hex.substr(i, 2).c_str(),
+            "%02X",
+            &value
+        );
+
+        result.push_back(
+            static_cast<unsigned char>(value)
+        );
+    }
+
+    return result;
+}
+
+void destroyDHE(DHE*& dh)
+{
+    if (dh != nullptr) {
+        BN_clear(dh->priv_key);
+        BN_clear(dh->pub_key);
+
+        std::fill(
+            dh->aes_key.begin(),
+            dh->aes_key.end(),
+            0
+        );
+
+        delete dh;
+        dh = nullptr;
+    }
+}
+
+std::string getTimestamp()
+{
+    auto now = std::chrono::system_clock::now();
+    std::time_t currentTime =
+        std::chrono::system_clock::to_time_t(now);
+
+    std::tm timeInfo;
+
+    localtime_r(&currentTime, &timeInfo);
+
+    std::ostringstream timestamp;
+
+    timestamp << std::put_time(
+        &timeInfo,
+        "%Y-%m-%d %H:%M:%S"
+    );
+
+    return timestamp.str();
+}
+
+bool sendClientServerMessage(
+    int socket,
+    DHE* dh,
+    const std::string& message)
+{
+    std::lock_guard<std::mutex> sendLock(socketSendMutex);
+
+    std::vector<unsigned char> encrypted =
+        dh->encrypt(message);
+
+    if (encrypted.empty()) {
+        return false;
+    }
+
+    return sendAll(
+        socket,
+        encrypted.data(),
+        encrypted.size()
+    );
+}
+
+bool sendE2EControl(
+    int socket,
+    DHE* dh,
+    const std::string& control)
+{
+    std::lock_guard<std::mutex> sendLock(socketSendMutex);
+    std::lock_guard<std::mutex> e2eLock(e2eMutex);
+
+    if (!e2eEstablished ||
+        e2eDh == nullptr ||
+        e2ePartner.empty()) {
+        return false;
+    }
+
+    std::vector<unsigned char> e2eEncrypted =
+        e2eDh->encrypt(control);
+
+    std::string routedMessage =
+        "@" + e2ePartner +
+        " __E2E_MSG__" +
+        toHex(e2eEncrypted);
+
+    std::vector<unsigned char> encrypted =
+        dh->encrypt(routedMessage);
+
+    if (encrypted.empty()) {
+        return false;
+    }
+
+    return sendAll(
+        socket,
+        encrypted.data(),
+        encrypted.size()
+    );
+}
+
+void startE2ERotation(int socket, DHE* dh)
+{
+    std::lock_guard<std::mutex> sendLock(socketSendMutex);
+    std::lock_guard<std::mutex> e2eLock(e2eMutex);
+
+    if (!clientRunning ||
+        !e2eEstablished ||
+        e2eDh == nullptr ||
+        e2ePartner.empty()) {
+        return;
+    }
+
+    if (localUsername >= e2ePartner) {
+        return;
+    }
+
+    if (e2eRotationInProgress) {
+        return;
+    }
+
+    e2eRotationRound++;
+
+    uint64_t round = e2eRotationRound;
+
+    DHE* newDh = new DHE();
+    newDh->generateKeys();
+
+    pendingE2eDh = newDh;
+    pendingRotationRound = round;
+    e2eRotationInProgress = true;
+
+    std::vector<unsigned char> publicKey =
+        getPublicKeyBytes(*pendingE2eDh);
+
+    std::string rekeyInit =
+        "__E2E_REKEY_INIT__" +
+        std::to_string(round) +
+        "__" +
+        toHex(publicKey);
+
+    std::vector<unsigned char> e2eEncrypted =
+        e2eDh->encrypt(rekeyInit);
+
+    std::string routedMessage =
+        "@" + e2ePartner +
+        " __E2E_MSG__" +
+        toHex(e2eEncrypted);
+
+    std::vector<unsigned char> encrypted =
+        dh->encrypt(routedMessage);
+
+    if (!sendAll(
+        socket,
+        encrypted.data(),
+        encrypted.size())) {
+
+        destroyDHE(pendingE2eDh);
+        e2eRotationInProgress = false;
+
+        std::cout
+            << "[E2E] Failed to send rekey initialization"
+            << std::endl;
+
+        return;
+    }
+
+    std::cout
+        << "[E2E] Key rotation initiated at "
+        << getTimestamp()
+        << " (Round "
+        << round
+        << ")"
+        << std::endl;
+}
+
+void rekeyTimer(int socket, DHE* dh)
+{
+    while (clientRunning) {
+
+        std::this_thread::sleep_for(
+            std::chrono::seconds(REKEY_INTERVAL_SECONDS)
+        );
+
+        if (!clientRunning) {
+            break;
+        }
+
+        startE2ERotation(socket, dh);
+    }
+}
+
+bool sendRekeyConfirmAndSwitch(
+    int socket,
+    DHE* dh,
+    uint64_t round)
+{
+    std::lock_guard<std::mutex> sendLock(socketSendMutex);
+    std::lock_guard<std::mutex> e2eLock(e2eMutex);
+
+    if (!e2eEstablished ||
+        e2eDh == nullptr ||
+        pendingE2eDh == nullptr ||
+        !e2eRotationInProgress ||
+        pendingRotationRound != round) {
+        return false;
+    }
+
+    std::string newFingerprint =
+        pendingE2eDh->getFingerPrint();
+
+    std::string confirm =
+        "__E2E_REKEY_CONFIRM__" +
+        std::to_string(round) +
+        "__" +
+        newFingerprint;
+
+    std::vector<unsigned char> e2eEncrypted =
+        e2eDh->encrypt(confirm);
+
+    std::string routedMessage =
+        "@" + e2ePartner +
+        " __E2E_MSG__" +
+        toHex(e2eEncrypted);
+
+    std::vector<unsigned char> encrypted =
+        dh->encrypt(routedMessage);
+
+    if (!sendAll(
+        socket,
+        encrypted.data(),
+        encrypted.size())) {
+
+        return false;
+    }
+
+    destroyDHE(e2eDh);
+
+    e2eDh = pendingE2eDh;
+    pendingE2eDh = nullptr;
+
+    e2eRotationInProgress = false;
+    pendingRotationRound = 0;
+
+    std::cout
+        << "[E2E] Key rotation completed at "
+        << getTimestamp()
+        << " (Round "
+        << round
+        << ")"
+        << std::endl;
+
+    std::cout
+        << "[E2E] New fingerprint: "
+        << e2eDh->getFingerPrint()
+        << std::endl;
+
+    return true;
+}
+
+void receiveMessages(int socket, DHE* dh) {
+    unsigned char buffer[4096] = {0}; 
+    while(true) {
+
+        memset(buffer, 0, sizeof(buffer));
+        int bytesReceived = recv(socket, buffer, sizeof(buffer),0);
+        
+        if(bytesReceived <= 0) {
+            std::cout << "\nDisconnected from server.\n";
+            clientRunning = false;
+            break;
+        }
+        
+        // Decrypt the incoming bytes
+        std::vector<unsigned char> payload(buffer, buffer + bytesReceived);
+        
+        std::string decrypted_msg = dh->decrypt(payload);
+
+        // if (payload.size() > 28) { 
+        //     std::cout << "\n[TEST] Flipping one bit in the received ciphertext..." << std::endl;
+        //     payload[30] ^= 0x01; 
+        // }
+        if (decrypted_msg.rfind("__E2E_FROM__", 0) == 0) {
+
+            size_t prefixLen = strlen("__E2E_FROM__");
+
+            size_t initPos = decrypted_msg.find("__E2E_INIT__", prefixLen);
+            size_t ackPos = decrypted_msg.find("__E2E_ACK__", prefixLen);
+            size_t msgPos = decrypted_msg.find("__E2E_MSG__", prefixLen);
+
+            size_t messagePos = std::string::npos;
+
+            if (initPos != std::string::npos)
+                messagePos = initPos;
+            else if (ackPos != std::string::npos)
+                messagePos = ackPos;
+            else if (msgPos != std::string::npos)
+                messagePos = msgPos;
+
+            if (messagePos != std::string::npos) {
+
+                size_t senderEnd = messagePos;
+
+                while (senderEnd > prefixLen &&
+                    decrypted_msg[senderEnd - 1] == '_') {
+                    senderEnd--;
+                }
+
+                std::lock_guard<std::mutex> e2eLock(e2eMutex);
+
+                e2ePartner = decrypted_msg.substr(
+                    prefixLen,
+                    senderEnd - prefixLen
+                );
+
+                decrypted_msg = decrypted_msg.substr(messagePos);
+            }
+        }
+        if (decrypted_msg.rfind("__E2E_INIT__", 0) == 0) {
+
+            std::cout << "\n[E2E] Received E2E initialization\n";
+            std::string keyData = decrypted_msg.substr(strlen("__E2E_INIT__"));
+
+            // Convert hexadecimal public key back to bytes
+            std::vector<unsigned char> peerKey = fromHex(keyData);
+            // Convert bytes to BIGNUM
+            BIGNUM* peerPubKey = BN_new();
+            BN_bin2bn(
+                peerKey.data(),
+                peerKey.size(),
+                peerPubKey
+            );
+            // Generate our E2E DH key pair
+            DHE* newE2eDh = new DHE();
+            newE2eDh->generateKeys();
+
+            // Compute C1 <-> C2 shared secret
+            newE2eDh->compute_key(peerPubKey);
+
+                BN_free(peerPubKey);
+
+                // Store E2E DH object
+                if (e2eDh != nullptr) {
+                    delete e2eDh;
+                }
+
+                e2eDh = newE2eDh;
+                e2eEstablished = true;
+
+                std::cout << "[E2E] Shared key established\n";
+
+                std::cout << "[E2E] Fingerprint: " << e2eDh->getFingerPrint() << std::endl;
+                std::vector<unsigned char> myKey = getPublicKeyBytes(*e2eDh);
+
+                std::string ack = "@" + e2ePartner + " __E2E_ACK__" + toHex(myKey);
+
+                // Encrypt ACK using CLIENT-SERVER key
+                std::vector<unsigned char> encryptedAck = dh->encrypt(ack);
+                if (!sendAll(socket, encryptedAck.data(), encryptedAck.size())) {
+                    std::cout << "[E2E] Failed to send ACK\n";
+                }
+                else {
+                    std::cout << "[E2E] ACK sent to " << e2ePartner << std::endl;
+                }
+                continue;
+        }
+
+        else if (decrypted_msg.rfind("__E2E_ACK__", 0) == 0) {
+            std::cout << "\n[E2E] Received E2E acknowledgment\n";
+
+            std::string keyData = decrypted_msg.substr(strlen("__E2E_ACK__"));
+            std::vector<unsigned char> peerKey = fromHex(keyData);
+
+            BIGNUM* peerPubKey = BN_new();
+
+            BN_bin2bn(
+                peerKey.data(),
+                peerKey.size(),
+                peerPubKey
+            );
+
+            if (e2eDh != nullptr) {
+                // Compute C1 <-> C2 shared secret
+                e2eDh->compute_key(peerPubKey);
+                e2eEstablished = true;
+                std::cout << "[E2E] Shared key established\n";
+                std::cout << "[E2E] Fingerprint: " << e2eDh->getFingerPrint() << std::endl;
+            }
+
+            BN_free(peerPubKey);
+
+            continue;
+        }
+
+        else if (decrypted_msg.rfind("__E2E_MSG__", 0) == 0) {
+            std::string encryptedData =
+                decrypted_msg.substr(strlen("__E2E_MSG__"));
+
+            std::vector<unsigned char> e2ePayload =
+                fromHex(encryptedData);
+
+            std::string plaintext;
+
+            {
+                std::lock_guard<std::mutex> e2eLock(e2eMutex);
+
+                if (!e2eEstablished || e2eDh == nullptr) {
+                    std::cout << "\n[E2E] No E2E key established\n";
+                    continue;
+                }
+
+                plaintext = e2eDh->decrypt(e2ePayload);
+            }
+
+            if (plaintext.rfind("__E2E_REKEY_INIT__", 0) == 0) {
+
+                size_t prefixLength =
+                    strlen("__E2E_REKEY_INIT__");
+
+                size_t separator =
+                    plaintext.find("__", prefixLength);
+
+                if (separator == std::string::npos) {
+                    continue;
+                }
+
+                uint64_t round =
+                    std::stoull(
+                        plaintext.substr(
+                            prefixLength,
+                            separator - prefixLength
+                        )
+                    );
+
+                std::string keyData =
+                    plaintext.substr(separator + 2);
+
+                std::lock_guard<std::mutex> sendLock(socketSendMutex);
+                std::lock_guard<std::mutex> e2eLock(e2eMutex);
+
+                if (!e2eEstablished ||
+                    e2eDh == nullptr) {
+                    continue;
+                }
+
+                if (localUsername < e2ePartner) {
+                    continue;
+                }
+
+                DHE* newDh = new DHE();
+                newDh->generateKeys();
+
+                std::vector<unsigned char> peerKey =
+                    fromHex(keyData);
+
+                BIGNUM* peerPubKey = BN_new();
+
+                BN_bin2bn(
+                    peerKey.data(),
+                    peerKey.size(),
+                    peerPubKey
+                );
+
+                newDh->compute_key(peerPubKey);
+
+                BN_free(peerPubKey);
+
+                destroyDHE(pendingE2eDh);
+
+                pendingE2eDh = newDh;
+                pendingRotationRound = round;
+                e2eRotationInProgress = true;
+
+                std::vector<unsigned char> myKey =
+                    getPublicKeyBytes(*pendingE2eDh);
+
+                std::string response =
+                    "__E2E_REKEY_RESPONSE__" +
+                    std::to_string(round) +
+                    "__" +
+                    toHex(myKey);
+
+                std::vector<unsigned char> responseEncrypted =
+                    e2eDh->encrypt(response);
+
+                std::string routedResponse =
+                    "@" + e2ePartner +
+                    " __E2E_MSG__" +
+                    toHex(responseEncrypted);
+
+                std::vector<unsigned char> encryptedResponse =
+                    dh->encrypt(routedResponse);
+
+                if (!sendAll(
+                    socket,
+                    encryptedResponse.data(),
+                    encryptedResponse.size())) {
+
+                    destroyDHE(pendingE2eDh);
+                    e2eRotationInProgress = false;
+                    pendingRotationRound = 0;
+
+                    std::cout
+                        << "[E2E] Failed to send rekey response"
+                        << std::endl;
+                }
+                else {
+
+                    std::cout
+                        << "[E2E] Rekey response sent for round "
+                        << round
+                        << std::endl;
+                }
+
+                continue;
+            }
+
+            if (plaintext.rfind("__E2E_REKEY_RESPONSE__", 0) == 0) {
+
+                size_t prefixLength =
+                    strlen("__E2E_REKEY_RESPONSE__");
+
+                size_t separator =
+                    plaintext.find("__", prefixLength);
+
+                if (separator == std::string::npos) {
+                    continue;
+                }
+
+                uint64_t round =
+                    std::stoull(
+                        plaintext.substr(
+                            prefixLength,
+                            separator - prefixLength
+                        )
+                    );
+
+                std::string keyData =
+                    plaintext.substr(separator + 2);
+
+                {
+                    std::lock_guard<std::mutex> e2eLock(e2eMutex);
+
+                    if (!e2eEstablished ||
+                        e2eDh == nullptr ||
+                        pendingE2eDh == nullptr ||
+                        !e2eRotationInProgress ||
+                        pendingRotationRound != round) {
+                        continue;
+                    }
+
+                    std::vector<unsigned char> peerKey =
+                        fromHex(keyData);
+
+                    BIGNUM* peerPubKey = BN_new();
+
+                    BN_bin2bn(
+                        peerKey.data(),
+                        peerKey.size(),
+                        peerPubKey
+                    );
+
+                    pendingE2eDh->compute_key(peerPubKey);
+
+                    BN_free(peerPubKey);
+                }
+
+                if (!sendRekeyConfirmAndSwitch(
+                    socket,
+                    dh,
+                    round)) {
+
+                    std::cout
+                        << "[E2E] Failed to complete key rotation"
+                        << std::endl;
+                }
+
+                continue;
+            }
+
+            if (plaintext.rfind("__E2E_REKEY_CONFIRM__", 0) == 0) {
+
+                size_t prefixLength =
+                    strlen("__E2E_REKEY_CONFIRM__");
+
+                size_t separator =
+                    plaintext.find("__", prefixLength);
+
+                if (separator == std::string::npos) {
+                    continue;
+                }
+
+                uint64_t round =
+                    std::stoull(
+                        plaintext.substr(
+                            prefixLength,
+                            separator - prefixLength
+                        )
+                    );
+
+                std::string fingerprint =
+                    plaintext.substr(separator + 2);
+
+                std::lock_guard<std::mutex> e2eLock(e2eMutex);
+
+                if (!e2eEstablished ||
+                    e2eDh == nullptr ||
+                    pendingE2eDh == nullptr ||
+                    !e2eRotationInProgress ||
+                    pendingRotationRound != round) {
+                    continue;
+                }
+
+                std::string expectedFingerprint =
+                    pendingE2eDh->getFingerPrint();
+
+                if (fingerprint != expectedFingerprint) {
+
+                    std::cout
+                        << "\n[E2E] Rekey confirmation fingerprint mismatch"
+                        << std::endl;
+
+                    destroyDHE(pendingE2eDh);
+                    e2eRotationInProgress = false;
+                    pendingRotationRound = 0;
+
+                    continue;
+                }
+
+                destroyDHE(e2eDh);
+
+                e2eDh = pendingE2eDh;
+                pendingE2eDh = nullptr;
+
+                e2eRotationInProgress = false;
+                pendingRotationRound = 0;
+
+                std::cout
+                    << "\n[E2E] Key rotation completed at "
+                    << getTimestamp()
+                    << " (Round "
+                    << round
+                    << ")"
+                    << std::endl;
+
+                std::cout
+                    << "[E2E] New fingerprint: "
+                    << e2eDh->getFingerPrint()
+                    << std::endl;
+
+                continue;
+            }
+
+            std::cout << "\n[E2E MESSAGE] "
+                      << plaintext
+                      << "\n"
+                      << std::flush;
+
+            continue;
+        }
+
+        else {
+            std::cout << "\n" << decrypted_msg << "\n" << std::flush;
+        }
+    }
+}
+
+bool recvAll(int socket, unsigned char* data, size_t length) {
+    size_t totalReceived = 0;
+
+    while (totalReceived < length) {
+        ssize_t received = recv(
+            socket,
+            data + totalReceived,
+            length - totalReceived,
+            0
+        );
+
+        if (received <= 0) {
+            return false;
+        }
+
+        totalReceived += received;
+    }
+
+    return true;
+}
+
+int main(int argc, char* argv[]) {
+
+    if (argc != 3) {
+        std::cout << "Usage: " << argv[0] << " <server_ip> <port>" << std::endl;
+        return 1;
+    }
+
+    const char* serverIP = argv[1];
+    int serverPort = std::stoi(argv[2]);
+
+    //creating socket
+    int clientSocket = socket(AF_INET, SOCK_STREAM, 0);
+
+    //defining server address
+    sockaddr_in serverAddress;
+
+    serverAddress.sin_family = AF_INET;
+    // serverAddress.sin_port = htons(1111);
+    // serverAddress.sin_addr.s_addr = INADDR_ANY;
+    serverAddress.sin_port = htons(serverPort);
+    inet_pton(AF_INET, serverIP, &serverAddress.sin_addr);
+
+    //connecting to server
+    if(connect(clientSocket, (struct sockaddr*)&serverAddress, sizeof(serverAddress)) < 0) {
+        std::cerr << "Connection Failed \n";
+        return 1;
+    }
+
+    std::cout << "Connected to the server \n";
+
+    uint32_t certLengthNetwork;
+
+    if (!recvAll(
+        clientSocket,
+        reinterpret_cast<unsigned char*>(&certLengthNetwork),
+        sizeof(certLengthNetwork))) {
+
+        std::cerr << "Failed to receive certificate length\n";
+        close(clientSocket);
+        return 1;
+    }
+
+    uint32_t certLength = ntohl(certLengthNetwork);
+
+    std::vector<unsigned char> serverCertificate(certLength);
+
+    if (!recvAll(
+        clientSocket,
+        serverCertificate.data(),
+        serverCertificate.size())) {
+
+        std::cerr << "Failed to receive server certificate\n";
+        close(clientSocket);
+        return 1;
+    }
+
+    std::cout << "Received server certificate ("
+          << serverCertificate.size()
+          << " bytes)\n";
+
+    BIO* certBio = BIO_new_mem_buf(
+        serverCertificate.data(),
+        serverCertificate.size()
+    );
+
+    X509* serverCert = PEM_read_bio_X509(
+        certBio,
+        nullptr,
+        nullptr,
+        nullptr
+    );
+    
+    if (!serverCert) {
+        std::cerr << "Failed to parse server certificate\n";
+        BIO_free(certBio);
+        close(clientSocket);
+        return 1;
+    }
+
+    FILE* caFile = fopen("certs/ca.crt", "r");
+
+    if (!caFile) {
+        std::cerr << "Could not open trusted CA certificate\n";
+        X509_free(serverCert);
+        BIO_free(certBio);
+        close(clientSocket);
+        return 1;
+    }
+
+    X509* caCert = PEM_read_X509(
+        caFile,
+        nullptr,
+        nullptr,
+        nullptr
+    );
+
+    fclose(caFile);
+
+
+    if (!caCert) {
+        std::cerr << "Failed to parse CA certificate\n";
+        X509_free(serverCert);
+        BIO_free(certBio);
+        close(clientSocket);
+        return 1;
+    }
+    X509_STORE* store = X509_STORE_new();
+
+    if (!store) {
+        std::cerr << "Failed to create certificate store\n";
+
+        X509_free(caCert);
+        X509_free(serverCert);
+        BIO_free(certBio);
+
+        close(clientSocket);
+        return 1;
+    }
+
+    if (X509_STORE_add_cert(store, caCert) != 1) {
+    std::cerr << "Failed to add CA certificate to trust store\n";
+
+        X509_STORE_free(store);
+        X509_free(caCert);
+        X509_free(serverCert);
+        BIO_free(certBio);
+
+        close(clientSocket);
+        return 1;
+    }
+
+    X509_STORE_CTX* verifyCtx = X509_STORE_CTX_new();
+
+    if (!verifyCtx) {
+        std::cerr << "Failed to create verification context\n";
+
+        X509_STORE_free(store);
+        X509_free(caCert);
+        X509_free(serverCert);
+        BIO_free(certBio);
+
+        close(clientSocket);
+        return 1;
+    }
+
+    if (X509_STORE_CTX_init(
+        verifyCtx,
+        store,
+        serverCert,
+        nullptr) != 1) {
+
+        std::cerr << "Failed to initialize certificate verification\n";
+
+        X509_STORE_CTX_free(verifyCtx);
+        X509_STORE_free(store);
+        X509_free(caCert);
+        X509_free(serverCert);
+        BIO_free(certBio);
+
+        close(clientSocket);
+        return 1;
+    }
+    
+    int verifyResult = X509_verify_cert(verifyCtx);
+
+    if (verifyResult != 1) {
+
+        std::cerr << "SERVER CERTIFICATE VALIDATION FAILED\n";
+
+        int error = X509_STORE_CTX_get_error(verifyCtx);
+
+        std::cerr << "Reason: "
+                  << X509_verify_cert_error_string(error)
+                  << std::endl;
+
+        X509_STORE_CTX_free(verifyCtx);
+        X509_STORE_free(store);
+        X509_free(caCert);
+        X509_free(serverCert);
+        BIO_free(certBio);
+
+        close(clientSocket);
+        return 1;
+    }
+
+    std::cout << "Server certificate validation SUCCESS\n";
+    X509_STORE_CTX_free(verifyCtx);
+    X509_STORE_free(store);
+    X509_free(caCert);
+    BIO_free(certBio);
+
+    //sednign a challenge for proof of possession
+    unsigned char challenge[32];
+    if (RAND_bytes(challenge, sizeof(challenge)) != 1) {
+        std::cerr << "Failed to generate challenge\n";
+        close(clientSocket);
+        return 1;
+    }
+
+    if (!sendAll(
+            clientSocket,
+            challenge,
+            sizeof(challenge))) {
+
+        std::cerr << "Failed to send challenge\n";
+        close(clientSocket);
+        return 1;
+    }
+    std::cout << "Challenge sent to server\n";
+
+
+    EVP_PKEY* serverPublicKey = X509_get_pubkey(serverCert);
+    if (!serverPublicKey) {
+        std::cerr << "Failed to extract public key from server certificate\n";
+
+        X509_free(serverCert);
+        close(clientSocket);
+        return 1;
+    }
+
+    uint32_t signatureLengthNetwork;
+
+    if (!recvAll(
+            clientSocket,
+            reinterpret_cast<unsigned char*>(&signatureLengthNetwork),
+            sizeof(signatureLengthNetwork))) {
+
+        std::cerr << "Failed to receive signature length\n";
+
+        EVP_PKEY_free(serverPublicKey);
+        X509_free(serverCert);
+        close(clientSocket);
+        return 1;
+    }
+    uint32_t signatureLength = ntohl(signatureLengthNetwork);
+    std::vector<unsigned char> signature(signatureLength);
+    
+    if (!recvAll(
+            clientSocket,
+            signature.data(),
+            signature.size())) {
+
+        std::cerr << "Failed to receive signature\n";
+
+        EVP_PKEY_free(serverPublicKey);
+        X509_free(serverCert);
+        close(clientSocket);
+        return 1;
+    }
+    std::cout << "Received server signature\n";
+    
+    EVP_MD_CTX* verifyCtx2 = EVP_MD_CTX_new();
+    if (!verifyCtx2) {
+    std::cerr << "Failed to create signature verification context\n";
+
+    EVP_PKEY_free(serverPublicKey);
+    X509_free(serverCert);
+    close(clientSocket);
+    return 1;
+}
+
+    if (EVP_DigestVerifyInit(
+            verifyCtx2,
+            nullptr,
+            EVP_sha256(),
+            nullptr,
+            serverPublicKey) != 1) {
+
+        std::cerr << "Failed to initialize signature verification\n";
+
+        EVP_MD_CTX_free(verifyCtx2);
+        EVP_PKEY_free(serverPublicKey);
+        X509_free(serverCert);
+        close(clientSocket);
+        return 1;
+    }
+
+    if (EVP_DigestVerifyUpdate(
+            verifyCtx2,
+            challenge,
+            sizeof(challenge)) != 1) {
+
+        std::cerr << "Failed to process challenge for verification\n";
+
+        EVP_MD_CTX_free(verifyCtx2);
+        EVP_PKEY_free(serverPublicKey);
+        X509_free(serverCert);
+        close(clientSocket);
+        return 1;
+    }
+
+    int signatureResult = EVP_DigestVerifyFinal(
+        verifyCtx2,
+        signature.data(),
+        signature.size()
+    );
+
+    if (signatureResult != 1) {
+
+        std::cerr << "SERVER PROOF-OF-POSSESSION FAILED\n";
+
+        EVP_MD_CTX_free(verifyCtx2);
+        EVP_PKEY_free(serverPublicKey);
+        X509_free(serverCert);
+
+        close(clientSocket);
+        return 1;
+    }
+    std::cout << "Server proof-of-possession SUCCESS\n";
+
+    EVP_MD_CTX_free(verifyCtx2);
+    EVP_PKEY_free(serverPublicKey);
+    X509_free(serverCert);
+    
+    //as soon as we connect to the serve we should exchange information
+    DHE dh;
+    dh.generateKeys();
+
+    //creating my own client side keys
+    int public_key_len = BN_num_bytes(dh.pub_key);
+    std::vector<unsigned char> public_key_bytes(public_key_len);
+    BN_bn2bin(dh.pub_key, public_key_bytes.data());
+
+    //sending server my (client's) public key
+    send(clientSocket, public_key_bytes.data(), public_key_len, 0);
+
+    //receiving server public key
+    unsigned char server_pub_key[256] = {0}; // 2048 bits is exactly 256 bytes
+    int bytesReceived = recv(clientSocket, server_pub_key, sizeof(server_pub_key), 0);
+
+    if(bytesReceived <= 0) {
+        std::cout << "Server Disconnected during handshake\n";
+        close(clientSocket);
+        return 1;
+    }
+
+    BIGNUM* bn = BN_new();
+    BN_bin2bn(server_pub_key, bytesReceived, bn);
+
+    dh.compute_key(bn);
+    std::cout << "DH Fingerprint: " << dh.getFingerPrint() << std::endl;
+    BN_free(bn); 
+
+    // char promptBuffer[1024] = {0};
+    // recv(clientSocket, promptBuffer, sizeof(promptBuffer)-1, 0);
+    // std::cout << promptBuffer; 
+    
+    // std::string username;
+    // std::getline(std::cin, username);
+    // send(clientSocket, username.c_str(), username.length(), 0);
+    unsigned char promptBuffer[1024] = {0};
+    int promptBytes = recv(clientSocket, promptBuffer, sizeof(promptBuffer), 0);
+    if(promptBytes > 0) {
+        std::vector<unsigned char> payload(promptBuffer, promptBuffer + promptBytes);
+        std::string decrypted_prompt = dh.decrypt(payload);
+        std::cout << decrypted_prompt; 
+    }
+
+    std::string username;
+    std::getline(std::cin, username);
+
+    localUsername = username;
+
+    std::vector<unsigned char> enc_username = dh.encrypt(username);
+    send(clientSocket, enc_username.data(), enc_username.size(), 0);
+
+
+    //incoming messages thread
+    //std::thread receiver(receiveMessages, clientSocket);
+    std::thread receiver(receiveMessages, clientSocket, &dh);
+    receiver.detach();
+
+    std::thread timerThread(rekeyTimer, clientSocket, &dh);
+    timerThread.detach();
+
+    std::string message;
+    std::string currentPartner = "";
+
+    while(true) {
+        std::cout << "Enter message: ";
+        std::getline(std::cin, message);
+
+        if(message.empty())
+            continue;
+
+        if(message == "/quit") {
+            std::vector<unsigned char> encrypted_msg = dh.encrypt("/quit");
+
+            {
+                std::lock_guard<std::mutex> sendLock(socketSendMutex);
+
+                sendAll(
+                    clientSocket,
+                    encrypted_msg.data(),
+                    encrypted_msg.size()
+                );
+            }
+
+            clientRunning = false;
+            break;
+        }
+        
+        //else if(message.length() >= 5 && message.substr(0, 5) == "/e2e") {
+        else if(message.rfind("/e2e ", 0) == 0) {
+
+            std::string target = message.substr(5);
+
+            if(target.empty()) {
+                std::cout
+                    << "[SYSTEM] Usage: /e2e username"
+                    << std::endl;
+                continue;
+            }
+
+            {
+                std::lock_guard<std::mutex> e2eLock(e2eMutex);
+
+                e2ePartner = target;
+                currentPartner = target;
+            }
+
+            bool shouldInitiate =
+                localUsername < target;
+
+            if (!shouldInitiate) {
+                std::cout
+                    << "[E2E] Waiting for "
+                    << target
+                    << " to initialize E2E"
+                    << std::endl;
+                continue;
+            }
+
+            {
+                std::lock_guard<std::mutex> sendLock(socketSendMutex);
+                std::lock_guard<std::mutex> e2eLock(e2eMutex);
+
+                e2eEstablished = false;
+
+                destroyDHE(e2eDh);
+                destroyDHE(pendingE2eDh);
+
+                e2eRotationInProgress = false;
+                pendingRotationRound = 0;
+
+                e2eDh = new DHE();
+                e2eDh->generateKeys();
+
+                std::vector<unsigned char> publicKey =
+                    getPublicKeyBytes(*e2eDh);
+
+                std::string e2eInit =
+                    "__E2E_INIT__" +
+                    toHex(publicKey);
+
+                std::string routedMessage =
+                    "@" + target + " " + e2eInit;
+
+                std::vector<unsigned char> encrypted =
+                    dh.encrypt(routedMessage);
+
+                if(!sendAll(
+                    clientSocket,
+                    encrypted.data(),
+                    encrypted.size())) {
+
+                    std::cout
+                        << "[E2E] Failed to send initialization"
+                        << std::endl;
+
+                    continue;
+                }
+
+                std::cout
+                    << "[E2E] Initialization sent to "
+                    << target
+                    << std::endl;
+            }
+        }
+        else if(message == "/who") {
+            std::vector<unsigned char> encrypted_msg = dh.encrypt("/who");
+
+            {
+                std::lock_guard<std::mutex> sendLock(socketSendMutex);
+
+                sendAll(
+                    clientSocket,
+                    encrypted_msg.data(),
+                    encrypted_msg.size()
+                );
+            }
+        }
+        
+        else if(message.length() >= 5 && message.substr(0, 5) == "/chat") {
+
+            if(message.length() > 6) {
+                currentPartner = message.substr(6);
+                std::cout << "Chat partner set to " << currentPartner << std::endl;
+            }
+            else {
+                std::cout << "Invalid Format. Use: /chat username" << std::endl;
+            }
+        }
+
+        else if(message[0] == '@') {
+            int space_pos = message.find(' ');
+            if(space_pos != std::string::npos) {
+                currentPartner = message.substr(1, space_pos-1);
+                std::cout << "[SYSTEM] Chat partner sent to: " << currentPartner << std::endl;
+                //std::vector<unsigned char> encrypted_msg = dh.encrypt(message);
+
+                std::string target = message.substr(1, space_pos - 1);
+
+                std::string actualMessage =
+                    message.substr(space_pos + 1);
+
+                std::string formatted_msg;
+
+                bool useE2E = false;
+
+                {
+                    std::lock_guard<std::mutex> e2eLock(e2eMutex);
+
+                    useE2E =
+                        e2eEstablished &&
+                        e2eDh != nullptr &&
+                        target == e2ePartner;
+                }
+
+                if (useE2E) {
+
+                    std::lock_guard<std::mutex> sendLock(socketSendMutex);
+                    std::lock_guard<std::mutex> e2eLock(e2eMutex);
+
+                    if (e2eEstablished &&
+                        e2eDh != nullptr &&
+                        target == e2ePartner) {
+
+                        std::vector<unsigned char> e2eEncrypted =
+                            e2eDh->encrypt(actualMessage);
+
+                        formatted_msg = 
+                            "@" + target +
+                            " __E2E_MSG__" +
+                            toHex(e2eEncrypted);
+
+                        std::vector<unsigned char> encrypted_msg =
+                            dh.encrypt(formatted_msg);
+
+                        sendAll(
+                            clientSocket,
+                            encrypted_msg.data(),
+                            encrypted_msg.size()
+                        );
+                    }
+
+                }
+                else {
+                    formatted_msg = message;
+
+                    std::vector<unsigned char> encrypted_msg =
+                        dh.encrypt(formatted_msg);
+
+                    {
+                        std::lock_guard<std::mutex> sendLock(socketSendMutex);
+
+                        sendAll(
+                            clientSocket,
+                            encrypted_msg.data(),
+                            encrypted_msg.size()
+                        );
+                    }
+                }
+            }
+            else {
+                std::cout << "[System] Invalid format. Use: @username message" << std::endl;
+            }
+        }
+        else {
+            if (currentPartner.empty()) {
+                std::cout << "[SYSTEM] No chat partner selected. Use /chat username first." << std::endl;
+            } 
+            else {
+                std::string formatted_msg;
+
+                bool useE2E = false;
+
+                {
+                    std::lock_guard<std::mutex> e2eLock(e2eMutex);
+
+                    if (currentPartner == e2ePartner &&
+                        e2eEstablished &&
+                        e2eDh != nullptr) {
+
+                        useE2E = true;
+                    }
+
+                    if (currentPartner == e2ePartner &&
+                        !e2eEstablished) {
+
+                        std::cout
+                            << "[E2E] Waiting for E2E handshake to complete"
+                            << std::endl;
+
+                        continue;
+                    }
+                }
+
+                if (useE2E) {
+
+                    std::lock_guard<std::mutex> sendLock(socketSendMutex);
+                    std::lock_guard<std::mutex> e2eLock(e2eMutex);
+
+                    if (e2eEstablished &&
+                        e2eDh != nullptr &&
+                        currentPartner == e2ePartner) {
+
+                        std::vector<unsigned char> e2eEncrypted =
+                            e2eDh->encrypt(message);
+
+                        std::string e2ePayload =
+                            toHex(e2eEncrypted);
+
+                        formatted_msg =
+                            "@" + currentPartner +
+                            " __E2E_MSG__" +
+                            e2ePayload;
+
+                        std::vector<unsigned char> encrypted_msg =
+                            dh.encrypt(formatted_msg);
+
+                        sendAll(
+                            clientSocket,
+                            encrypted_msg.data(),
+                            encrypted_msg.size()
+                        );
+                    }
+
+                }      
+                else {
+                    formatted_msg =
+                        "@" + currentPartner +
+                        " " +
+                        message;
+
+                    std::vector<unsigned char> encrypted_msg =
+                        dh.encrypt(formatted_msg);
+
+                    {
+                        std::lock_guard<std::mutex> sendLock(socketSendMutex);
+
+                        sendAll(
+                            clientSocket,
+                            encrypted_msg.data(),
+                            encrypted_msg.size()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    clientRunning = false;
+
+    {
+        std::lock_guard<std::mutex> e2eLock(e2eMutex);
+
+        destroyDHE(e2eDh);
+        destroyDHE(pendingE2eDh);
+
+        e2eEstablished = false;
+        e2eRotationInProgress = false;
+    }
+
+    close(clientSocket);
+}
