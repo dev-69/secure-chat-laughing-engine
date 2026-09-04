@@ -11,6 +11,7 @@
 #include <vector>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
+#include <netdb.h>
 
 #include "dh.cpp"
 
@@ -409,7 +410,17 @@ int main() {
     listen(serverSocket, 5);
 
     std::cout << "Server ready waiting for client connections " << std::endl; 
+    char hostname[256];
+    gethostname(hostname, sizeof(hostname));
 
+    struct hostent* host = gethostbyname(hostname);
+
+    if (host != nullptr) {
+        std::cout << "Server IP: "
+                << inet_ntoa(*((struct in_addr*)host->h_addr_list[0]))
+                << std::endl;
+    }
+    std::cout << "Server Port: 1111" << std::endl;
 
     while(true) {
         //now multiple threads will be accepting client connection

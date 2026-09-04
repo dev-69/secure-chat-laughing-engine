@@ -79,7 +79,16 @@ bool recvAll(int socket, unsigned char* data, size_t length) {
     return true;
 }
 
-int main() {
+int main(int argc, char* argv[]) {
+
+    if (argc != 3) {
+        std::cout << "Usage: " << argv[0] << " <server_ip> <port>" << std::endl;
+        return 1;
+    }
+
+    const char* serverIP = argv[1];
+    int serverPort = std::stoi(argv[2]);
+
 
     //creating socket
     int clientSocket = socket(AF_INET, SOCK_STREAM, 0);
@@ -88,8 +97,11 @@ int main() {
     sockaddr_in serverAddress;
 
     serverAddress.sin_family = AF_INET;
-    serverAddress.sin_port = htons(9999);
-    serverAddress.sin_addr.s_addr = INADDR_ANY;
+    //serverAddress.sin_port = htons(9999);
+    //serverAddress.sin_addr.s_addr = INADDR_ANY;
+    serverAddress.sin_port = htons(serverPort);
+    inet_pton(AF_INET, serverIP, &serverAddress.sin_addr);
+
 
     //connecting to server
     if(connect(clientSocket, (struct sockaddr*)&serverAddress, sizeof(serverAddress)) < 0) {
