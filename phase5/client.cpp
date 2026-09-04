@@ -33,7 +33,7 @@ std::mutex e2eMutex;
 std::mutex socketSendMutex;
 std::atomic<bool> clientRunning(true);
 
-const int REKEY_INTERVAL_SECONDS = 10;
+const int REKEY_INTERVAL_SECONDS = 60;
 
 std::string getE2EFingerprint(DHE& dh)
 {

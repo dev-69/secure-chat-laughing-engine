@@ -1,0 +1,13 @@
+# Temporary files & IDE configs
+tempCodeRunnerFile*
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+.DS_Store
+
+# Network captures
+*.pcap
+*.pcapng
+test_*.py
