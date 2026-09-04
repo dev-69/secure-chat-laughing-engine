@@ -1,25 +1,27 @@
-# Phase 1 - Baseline Chat Application
+# Phase 1: Baseline Chat Application
 
-## Compile
+## Overview
+Phase 1 implements a baseline one-to-one TCP chat application between two clients connected through a central server. All traffic is transmitted as plaintext over TCP.
+
+## Compilation
 ```bash
 g++ -O2 -pthread server.cpp -o server
 g++ -O2 -pthread client.cpp -o client
 ```
 
-## Run
-1. Start server:
+## Running the Application
+1. **Start the Server** (listens on port 1111):
    ```bash
    ./server
    ```
 
-2. Start client(s):
+2. **Start the Clients**:
    ```bash
    ./client <server_ip> 1111
    ```
 
-## Commands
-- `@username message` : Send message to user
-- `/chat username`    : Set default chat partner
-- `/who`              : List online users
-- `/quit`             : Disconnect and exit
-
+## Client Commands
+- `@username <message>` : Send a direct message to `username`.
+- `/chat <username>`    : Set default recipient for subsequent messages.
+- `/who`               : Query the server for a list of online users.
+- `/quit`              : Cleanly disconnect from the server and exit.

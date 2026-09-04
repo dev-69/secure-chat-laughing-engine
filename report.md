@@ -774,3 +774,312 @@ Encrypted Chat
 ```
 
 The Phase 2 MITM attack is successfully prevented because an attacker cannot authenticate as the server without a certificate signed by the trusted CA and the corresponding server private key.
+
+
+# Phase 4 — End-to-End Encryption Between Clients
+
+## 1. Overview
+
+Phase 4 adds an additional end-to-end encryption layer between clients.
+
+When Client 1 executes:
+
+```text
+/e2e client2
+```
+
+Client 1 and Client 2 perform a separate Diffie–Hellman exchange directly at the application level. The server only relays the handshake messages and does not obtain the resulting shared key.
+
+Once the E2E session is established, chat messages are encrypted using the client-to-client key before being sent through the existing encrypted client-server connection from Phase 3.
+
+The resulting structure is:
+
+```text
+Client 1
+   │
+   │ E2E encryption
+   ▼
+E2E Ciphertext
+   │
+   │ Client-server encryption
+   ▼
+Server
+   │
+   │ Relay only
+   ▼
+Client 2
+   │
+   │ E2E decryption
+   ▼
+Plaintext
+```
+
+The server can still see routing information such as the sender and destination username, but it cannot derive the E2E key or decrypt the message content.
+
+---
+
+## 2. E2E Key Establishment
+
+The `/e2e username` command triggers the client-to-client key exchange.
+
+The protocol distinguishes E2E handshake messages from normal chat messages using tags such as:
+
+* `__E2E_INIT__`
+* `__E2E_ACK__`
+* `__E2E_MSG__`
+
+The server does not need to understand these messages cryptographically. It simply forwards them to the appropriate client.
+
+After the exchange, both clients independently derive the same E2E key.
+
+**Figure 10 — Matching E2E Fingerprints**
+
+> **[INSERT SCREENSHOT HERE]**
+
+The matching fingerprints provide evidence that both clients derived the same E2E key.
+
+---
+
+## 3. End-to-End Message Encryption
+
+After the E2E session is established, messages are encrypted using the client-to-client key and AES-GCM.
+
+The resulting ciphertext is wrapped using `__E2E_MSG__` and sent through the already encrypted client-server connection.
+
+The server therefore receives only opaque E2E ciphertext.
+
+**Figure 11 — Server Relaying E2E Ciphertext**
+
+> **[INSERT SCREENSHOT HERE]**
+
+The server can identify that `client1` is sending data to `client2`, but the actual message content is not visible.
+
+For comparison, before an E2E session is established, the server can still read normal chat messages, consistent with the Phase 2/3 design.
+
+---
+
+## 4. End-to-End Verification
+
+A test message was sent from Client 1 to Client 2 after establishing the E2E session.
+
+The server log showed only the E2E ciphertext, while Client 2 successfully decrypted and displayed the original message.
+
+**Figure 12 — E2E Message Successfully Decrypted**
+
+> **[INSERT SCREENSHOT HERE]**
+
+This confirms that:
+* Client 1 and Client 2 successfully established a shared E2E key.
+* The server could not read the E2E message content.
+* The server continued to function purely as a relay.
+* Client 2 could correctly decrypt the message.
+
+---
+
+## 5. Phase 4 Result
+
+Phase 4 introduces an additional encryption layer between clients without replacing the existing client-server security from Phase 3.
+
+The server continues to provide routing and transport, but it does not possess the client-to-client E2E key. The matching fingerprints demonstrate that the two clients independently derived the same key, while the server log demonstrates that E2E chat content is transmitted only as opaque ciphertext.
+
+Thus, the confidentiality of messages is extended from client-server encryption to true client-to-client end-to-end encryption.
+
+
+# Phase 5 — Forward Secrecy via Key Rotation
+
+## 1. Overview
+
+While Phase 4 provides end-to-end confidentiality between clients, it relies on a single, long-lived session key negotiated at connection time. If an adversary passively logs all encrypted network traffic over the wire and later compromises one of the endpoints (or extracts the key from memory), the adversary can retroactively decrypt all historical messages.
+
+Phase 5 addresses this limitation by introducing **Forward Secrecy via periodic key rotation**. The shared symmetric key between Client 1 and Client 2 is automatically renegotiated on a fixed timer every 60 seconds. Each renegotiation produces a genuinely new, independent key, and the previous key is discarded and erased from memory.
+
+---
+
+## 2. Automatic Key Rotation Architecture
+
+Key rotation is managed automatically by a dedicated background thread (`rekeyTimer`) running on each client:
+
+```text
+Client 1 (e.g. dev)                                  Client 2 (e.g. sanchit)
+       │                                                    │
+       │═══════════ Active E2E Session (Key K1) ════════════│
+       │                                                    │
+[60s Timer Expires]                                         │
+       │                                                    │
+       │───── __E2E_REKEY_INIT__ (Round 1 + New g^a) ──────►│
+       │                                                    │
+       │                                            [Computes Key K2]
+       │                                                    │
+       │◄──── __E2E_REKEY_RESPONSE__ (Round 1 + g^b) ───────│
+       │                                                    │
+[Computes Key K2]                                           │
+[Wipes Old Key K1]                                          │
+       │                                                    │
+       │───── __E2E_REKEY_CONFIRM__ (Round 1 + FP) ────────►│
+       │                                                    │
+       │                                            [Wipes Old Key K1]
+       │                                                    │
+       │═══════════ Active E2E Session (Key K2) ════════════│
+```
+
+For every rotation cycle:
+1. A fresh ephemeral Diffie–Hellman key pair is generated using RFC 3526 Group 14 (`new DHE()`, `generateKeys()`).
+2. The public key is exchanged inside an encrypted control message relayed through the server.
+3. Both clients compute the new shared secret, hash it with SHA-256 to derive a new 256-bit AES key, and verify matching fingerprints.
+4. The previous key is securely wiped and freed from memory using `destroyDHE()`.
+
+---
+
+## 3. Forward Secrecy and Old Key Destruction
+
+To guarantee forward secrecy, old keys must not persist in process memory. The `destroyDHE` function explicitly clears the OpenSSL `BIGNUM` private and public components using `BN_clear()`, zeroes out the raw AES symmetric key vector with `std::fill`, and frees the allocated memory:
+
+```cpp
+void destroyDHE(DHE*& dh) {
+    if (dh != nullptr) {
+        BN_clear(dh->priv_key);
+        BN_clear(dh->pub_key);
+        std::fill(dh->aes_key.begin(), dh->aes_key.end(), 0);
+        delete dh;
+        dh = nullptr;
+    }
+}
+```
+
+Once confirmation completes, the old session key is permanently erased from memory.
+
+---
+
+## 4. Collision Avoidance Mechanism
+
+A critical challenge in decentralized rekeying is handling race conditions where both clients attempt to trigger renegotiation at approximately the same time. If both clients simultaneously send rekey initialization requests, they risk computing mismatched keys or deadlocking.
+
+To resolve this, the protocol enforces a deterministic leader election based on lexicographical username comparison:
+
+```cpp
+if (localUsername >= e2ePartner) {
+    return; // Only the client with lower username initiates rotation
+}
+```
+
+By designating the client with `localUsername < e2ePartner` (e.g. `dev < sanchit`, where `dev` initiates rotation) as the authoritative rotation initiator, collisions are eliminated by design. If an unexpected rekey initialization arrives while one is already in progress, the lower-priority peer yields, drops its pending request, and answers the initiator's request.
+
+---
+
+## 5. Verification and Results
+
+### 5.1 Successive Key Rotations (Fingerprints and Timestamps)
+
+The chat application was deployed and verified across separate virtual machines:
+* **Server VM (`server`):** `10.91.240.119:1111`
+* **Client 1 VM (`client1`):** `10.91.240.136` (User: `dev`)
+* **Client 2 VM (`client2`):** `10.91.240.179` (User: `sanchit`)
+
+The verification demonstrated the following lifecycle across two full rotations:
+* **Initial Handshake:** Both client VMs established the initial E2E session across the virtual network and printed matching fingerprints:
+  ```text
+  [E2E] Fingerprint: 036f6ef30aa52e33
+  ```
+* **Pre-Rotation Chat:** Client 1 (`dev`) transmitted `"Hello sanchit how are you ?"`, which Client 2 (`sanchit`) received and decrypted successfully.
+* **60-Second Rotation (Round 1):** After 60 seconds, the background timer automatically triggered rotation. Both clients renegotiated keys and confirmed matching fingerprints at the exact same timestamp:
+  ```text
+  [E2E] Key rotation completed at 2026-09-04 23:23:58 (Round 1)
+  [E2E] New fingerprint: c2d66cf834bb1a56
+  ```
+* **60-Second Rotation (Round 2):** After another 60 seconds, the background timer triggered a second rotation. Both clients renegotiated keys again and confirmed matching fingerprints at the exact same timestamp:
+  ```text
+  [E2E] Key rotation completed at 2026-09-04 23:24:58 (Round 2)
+  [E2E] New fingerprint: deff0e18ea3c60e3
+  ```
+
+The fingerprints changed from `036f6ef30aa52e33` to `c2d66cf834bb1a56` to `deff0e18ea3c60e3`, proving across two successive rotations that:
+1. The fingerprint changes each time (genuinely fresh ephemeral secrets).
+2. Both clients agree on the exact same fingerprint after every rotation.
+
+**Figure 13 — Matching Phase 5 Rekey Fingerprints Across Rotations**
+
+![Figure 13 — Matching Phase 5 Rekey Fingerprints Across Rotations](images/phase5_rekey_fingerprints.png)
+
+### 5.2 Post-Rotation Message Delivery
+
+To confirm that ongoing communication was not disrupted by key rotation, a message was sent across the virtual network immediately after the Round 1 rotation completed:
+* `sanchit` (on `client2` VM) sent: `"@dev hello dev, Im good how about you ?"`
+* `dev` (on `client1` VM) received and decrypted: `"[E2E MESSAGE] hello dev, Im good how about you ?"`
+
+The server log on the `server` VM confirmed that it only relayed opaque ciphertext (`[CHAT-E2E] sanchit -> dev : E2E_MSG 8993DFB3CADC6CDD...`) without accessing message content or key material.
+
+**Figure 14 — Successful Post-Rotation Message Delivery Across VMs**
+
+![Figure 14 — Successful Post-Rotation Message Delivery Across VMs](images/phase5_post_rotation_chat.png)
+
+The message was decrypted without errors or dropped packets, proving that the live chat session transitions seamlessly across key boundaries over a live network.
+
+---
+
+## 6. Discussion: Forward Secrecy Security Properties
+
+In terms of attacker capabilities, forward secrecy provides the following concrete security guarantees:
+
+* **What an attacker CAN do if a key is compromised:**
+  If an adversary compromises one of the endpoint machines and extracts the active symmetric key $K_i$, the adversary can only decrypt messages transmitted during that specific 60-second window.
+* **What an attacker CANNOT do:**
+  1. **Past Traffic (Forward Secrecy):** The adversary cannot decrypt any past messages sent using keys $K_1, K_2, \dots, K_{i-1}$. Because old keys are wiped from memory via `destroyDHE()` and each DH exchange uses fresh random exponents ($a_i, b_i$), knowing $K_i$ provides zero mathematical advantage in deriving past shared secrets.
+  2. **Future Traffic (Post-Compromise Security):** Once the next 60-second rotation occurs, fresh ephemeral exponents are generated. Unless the adversary maintains persistent, continuous code execution on the host, they cannot decrypt subsequent sessions.
+
+Phase 4 alone lacked this guarantee: a compromise of the single session key in Phase 4 exposes the entire communication history of that session. Phase 5 confines the blast radius of any key compromise to a single 60-second time slice.
+
+
+# Appendix A — Generative AI Usage
+
+Some of the prompts that were used during the development of the assignment:
+
+### Phase 1 — Baseline Chat Application
+* Explain how to implement a one-to-one chat application using TCP sockets in C++.
+* Help me understand how the client and server should communicate in a TCP chat application.
+* Help me fix this problem in TCP socket chat application.
+
+### Phase 2 — Diffie–Hellman and AES-GCM
+* Explain how Diffie–Hellman key exchange works and how it can be implemented using OpenSSL BIGNUM.
+* Help me implement Diffie–Hellman manually using RFC 3526 Group 14 without using OpenSSL's built-in DH/ECDH APIs.
+* How can I derive an AES-256 key from the Diffie–Hellman shared secret using SHA-256?
+* Help me implement AES-256-GCM encryption and decryption using OpenSSL.
+* Help me implement a MITM proxy to demonstrate the vulnerability in the unauthenticated Diffie–Hellman exchange.
+* Help me troubleshoot AES-GCM decryption and tamper detection.
+
+### Phase 3 — PKI and Server Authentication
+* Explain how to create a Certificate Authority and issue a server certificate using OpenSSL.
+* Help me implement server certificate validation in the C++ client using OpenSSL.
+* How can I verify that a server possesses the private key corresponding to its certificate?
+* Help me implement a challenge-response proof-of-possession mechanism using OpenSSL signatures.
+* Help me update the MITM attack so that it fails against certificate validation and proof-of-possession.
+* Help me troubleshoot certificate validation and signature verification errors.
+
+### Phase 4 — End-to-End Encryption
+* Explain how to modify the existing chat application to provide end-to-end encryption between clients while the server only relays encrypted messages.
+* Help me implement a separate Diffie–Hellman exchange between two clients while maintaining the existing client-server encrypted connection.
+* How should E2E_INIT, E2E_ACK, and E2E_MSG messages be handled?
+* Help me troubleshoot why the E2E acknowledgement is not being received by the initiating client.
+* Why can simultaneous E2E key exchanges cause the two clients to derive different keys?
+* Review my client.cpp and identify the issue with the E2E handshake.
+* Can the E2E implementation be fixed without introducing TCP message framing?
+
+### Phase 5 — Forward Secrecy via Key Rotation
+* How do I implement periodic key renegotiation in a chat application using a background timer thread?
+* How to avoid collisions when both clients attempt to initiate key renegotiation at the same time?
+* What is the difference between forward secrecy and break-in recovery (post-compromise security)?
+* How should old keys be securely erased from memory in OpenSSL (using BN_clear and vector zeroing)?
+* How to ensure that chat messages sent during or right before a key rotation are not dropped?
+
+### Troubleshooting and Testing
+* Help me troubleshoot this OpenSSL compilation error: fatal error: openssl/bn.h: No such file or directory.
+* Help me troubleshoot SSH key and host-key issues on the lab machines.
+* Help me understand what the Wireshark packet capture demonstrates about confidentiality.
+* What evidence should I include in the report to demonstrate that the MITM attack succeeds or fails?
+* Review my implementation and suggest what should be tested for each security phase.
+
+### Report Preparation
+* Help me structure the Network Security assignment report.
+* Rewrite my Phase 1 implementation description in a clear technical style.
+* Help me explain the security improvements between each phase.
+* What screenshots and evidence should be included in the report?
+* Help me write the discussion of security properties and limitations.
