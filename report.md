@@ -114,7 +114,7 @@ Additionally, the traffic was captured using **Wireshark**. The TCP conversation
 
 **Figure 1: Wireshark TCP Stream showing plaintext communication**
 
-> **[INSERT WIRESHARK SCREENSHOT HERE]**
+![Figure: Wireshark TCP Stream showing plaintext communication](images/img-000.png)
 
 The capture confirms that an observer capable of monitoring the network traffic can read the exchanged messages without requiring any decryption.
 
@@ -379,7 +379,7 @@ This demonstrates that both endpoints independently derived the same symmetric k
 
 **Figure 1: Matching DH fingerprints on client and server**
 
-> **[INSERT DH FINGERPRINT SCREENSHOT HERE]**
+![Figure: Matching DH fingerprints on client and server](images/img-001.png)
 
 ---
 
@@ -399,7 +399,9 @@ Instead, the TCP stream contains binary-looking encrypted data corresponding to 
 
 **Figure 2: Wireshark capture showing encrypted Phase 2 traffic**
 
-> **[INSERT WIRESHARK SCREENSHOT HERE]**
+![Figure: Wireshark capture showing encrypted Phase 2 traffic](images/img-002.png)
+
+![Figure: Detailed Wireshark packet breakdown](images/img-003.png)
 
 This demonstrates that a passive network observer can no longer directly read the application message from the captured TCP stream.
 
@@ -434,7 +436,7 @@ Therefore, modified ciphertext is rejected instead of being silently decrypted i
 
 **Figure 3: AES-GCM tampering test**
 
-> **[INSERT TAMPERING TEST SCREENSHOT HERE]**
+![Figure: AES-GCM tampering test](images/img-004.png)
 
 The observed result was:
 
@@ -517,7 +519,13 @@ This allows Mallory to read the supposedly protected communication while still a
 
 **Figure 4: MITM proxy successfully intercepting plaintext**
 
-> **[INSERT MITM LOG SCREENSHOT HERE]**
+![Figure: MITM interception terminal outputs](images/img-005.png)
+
+![Figure: Server terminal during MITM interception](images/img-006.png)
+
+![Figure: MITM proxy plaintext logging](images/img-007.png)
+
+![Figure: Client terminal during MITM attack](images/img-008.png)
 
 Example output:
 
@@ -608,7 +616,7 @@ openssl x509 -req \
 
 ### Screenshot – OpenSSL Certificate Generation
 
-**[INSERT SCREENSHOT HERE]**
+![OpenSSL Certificate Generation](images/img-009.png)
 
 ---
 
@@ -662,7 +670,7 @@ Only after successful proof-of-possession does the client proceed with the Diffi
 
 ### Screenshot – Legitimate Phase 3 Connection
 
-**[INSERT SCREENSHOT HERE]**
+![Legitimate Phase 3 Connection](images/img-010.png)
 
 The screenshot should show:
 
@@ -705,7 +713,7 @@ The MITM observes that the victim closes the connection.
 
 ### Screenshot – MITM Attack Failure
 
-**[INSERT SCREENSHOT HERE]**
+![MITM Attack Failure](images/img-011.png)
 
 ---
 
@@ -732,7 +740,7 @@ The MITM observes that the victim closes the connection.
 
 ### Screenshot – Proof-of-Possession Failure
 
-**[INSERT SCREENSHOT HERE]**
+![Proof-of-Possession Failure](images/img-012.png)
 
 ---
 
@@ -834,7 +842,7 @@ After the exchange, both clients independently derive the same E2E key.
 
 **Figure 10 — Matching E2E Fingerprints**
 
-> **[INSERT SCREENSHOT HERE]**
+![Figure 10 — Matching E2E Fingerprints](images/img-013.png)
 
 The matching fingerprints provide evidence that both clients derived the same E2E key.
 
@@ -850,7 +858,7 @@ The server therefore receives only opaque E2E ciphertext.
 
 **Figure 11 — Server Relaying E2E Ciphertext**
 
-> **[INSERT SCREENSHOT HERE]**
+*(Relayed ciphertext visible in server terminal logs shown in Figure 10 and Figure 12)*
 
 The server can identify that `client1` is sending data to `client2`, but the actual message content is not visible.
 
@@ -866,7 +874,7 @@ The server log showed only the E2E ciphertext, while Client 2 successfully decry
 
 **Figure 12 — E2E Message Successfully Decrypted**
 
-> **[INSERT SCREENSHOT HERE]**
+![Figure 12 — E2E Message Successfully Decrypted](images/img-014.png)
 
 This confirms that:
 * Client 1 and Client 2 successfully established a shared E2E key.
@@ -971,26 +979,22 @@ By designating the client with `localUsername < e2ePartner` (e.g. `dev < sanchit
 ### 5.1 Successive Key Rotations (Fingerprints and Timestamps)
 
 The chat application was deployed and verified across separate virtual machines:
+
 * **Server VM (`server`):** `10.91.240.119:1111`
 * **Client 1 VM (`client1`):** `10.91.240.136` (User: `dev`)
 * **Client 2 VM (`client2`):** `10.91.240.179` (User: `sanchit`)
 
 The verification demonstrated the following lifecycle across two full rotations:
+
 * **Initial Handshake:** Both client VMs established the initial E2E session across the virtual network and printed matching fingerprints:
-  ```text
-  [E2E] Fingerprint: 036f6ef30aa52e33
-  ```
+  <br>`[E2E] Fingerprint: 036f6ef30aa52e33`
 * **Pre-Rotation Chat:** Client 1 (`dev`) transmitted `"Hello sanchit how are you ?"`, which Client 2 (`sanchit`) received and decrypted successfully.
 * **60-Second Rotation (Round 1):** After 60 seconds, the background timer automatically triggered rotation. Both clients renegotiated keys and confirmed matching fingerprints at the exact same timestamp:
-  ```text
-  [E2E] Key rotation completed at 2026-09-04 23:23:58 (Round 1)
-  [E2E] New fingerprint: c2d66cf834bb1a56
-  ```
+  <br>`[E2E] Key rotation completed at 2026-09-04 23:23:58 (Round 1)`
+  <br>`[E2E] New fingerprint: c2d66cf834bb1a56`
 * **60-Second Rotation (Round 2):** After another 60 seconds, the background timer triggered a second rotation. Both clients renegotiated keys again and confirmed matching fingerprints at the exact same timestamp:
-  ```text
-  [E2E] Key rotation completed at 2026-09-04 23:24:58 (Round 2)
-  [E2E] New fingerprint: deff0e18ea3c60e3
-  ```
+  <br>`[E2E] Key rotation completed at 2026-09-04 23:24:58 (Round 2)`
+  <br>`[E2E] New fingerprint: deff0e18ea3c60e3`
 
 The fingerprints changed from `036f6ef30aa52e33` to `c2d66cf834bb1a56` to `deff0e18ea3c60e3`, proving across two successive rotations that:
 1. The fingerprint changes each time (genuinely fresh ephemeral secrets).
@@ -1003,6 +1007,7 @@ The fingerprints changed from `036f6ef30aa52e33` to `c2d66cf834bb1a56` to `deff0
 ### 5.2 Post-Rotation Message Delivery
 
 To confirm that ongoing communication was not disrupted by key rotation, a message was sent across the virtual network immediately after the Round 1 rotation completed:
+
 * `sanchit` (on `client2` VM) sent: `"@dev hello dev, Im good how about you ?"`
 * `dev` (on `client1` VM) received and decrypted: `"[E2E MESSAGE] hello dev, Im good how about you ?"`
 
