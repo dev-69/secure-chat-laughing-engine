@@ -20,7 +20,15 @@ void receiveMessages(int socket) {
     }
 }
 
-int main() {
+int main(int argc, char* argv[]) {
+
+    if (argc != 3) {
+        std::cout << "Usage: " << argv[0] << " <server_ip> <port>" << std::endl;
+        return 1;
+    }
+
+    const char* serverIP = argv[1];
+    int serverPort = std::stoi(argv[2]);
 
     //creating socket
     int clientSocket = socket(AF_INET, SOCK_STREAM, 0);
@@ -29,9 +37,10 @@ int main() {
     sockaddr_in serverAddress;
 
     serverAddress.sin_family = AF_INET;
-    serverAddress.sin_port = htons(1111);
-
-    inet_pton(AF_INET, "192.168.0.102", &serverAddress.sin_addr);
+    // serverAddress.sin_port = htons(1111);
+    // inet_pton(AF_INET, "192.168.0.102", &serverAddress.sin_addr);
+    serverAddress.sin_port = htons(serverPort);
+    inet_pton(AF_INET, serverIP, &serverAddress.sin_addr);
 
     //connecting to server
     if(connect(clientSocket, (struct sockaddr*)&serverAddress, sizeof(serverAddress)) < 0) {

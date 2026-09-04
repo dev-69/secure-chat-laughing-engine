@@ -8,6 +8,7 @@
 #include <thread>
 #include <unordered_map>
 #include <mutex>
+#include <netdb.h>
 
 std::unordered_map<std::string, int> clients;
 std::mutex clients_mutex;
@@ -138,6 +139,17 @@ int main() {
 
     std::cout << "Server ready waiting for client connections " << std::endl; 
 
+    char hostname[256];
+    gethostname(hostname, sizeof(hostname));
+
+    struct hostent* host = gethostbyname(hostname);
+
+    if (host != nullptr) {
+        std::cout << "Server IP: "
+                << inet_ntoa(*((struct in_addr*)host->h_addr_list[0]))
+                << std::endl;
+    }
+    std::cout << "Server Port: 1111" << std::endl;
 
     while(true) {
         //now multiple threads will be accepting client connection
